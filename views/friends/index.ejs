@@ -97,11 +97,13 @@
                                 <a href="/profile/<%=friend  %>">
                                     <h5 class="card-title ml-2"><%=friendinfo.username  %> </h5>
                                 </a>
-                                <form action="/friends/<%=friend %>/removefriend?_method=PUT" method="POST"
-                                    class="ml-auto">
-                                    <button class="btn btn-info btn-sm button_color" type="submit">
-                                         Unfriend</button>
-                                </form>
+                                <div class="row ml-auto">
+                                    <a href="/private-chats?open=<%=friend %>" class="btn btn-success btn-sm mr-2"><i class="fa fa-lock"></i> Chat</a>
+                                    <form action="/friends/<%=friend %>/removefriend?_method=PUT" method="POST">
+                                        <button class="btn btn-info btn-sm button_color" type="submit">
+                                             Unfriend</button>
+                                    </form>
+                                </div>
                             </div>
 
                         </div>

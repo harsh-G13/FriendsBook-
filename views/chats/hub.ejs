@@ -1,0 +1,492 @@
+<%- include('../partials/header') %>
+<div class="chat-hub-wrapper">
+    <div class="chat-hub">
+        <!-- Left sidebar: Friends list -->
+        <div class="chat-sidebar" id="chat-sidebar">
+            <div class="chat-sidebar-header">
+                <h5><i class="fa fa-lock"></i> Private Chats</h5>
+            </div>
+            <div class="chat-search-box">
+                <input type="text" id="friend-search" placeholder="Search friends..." class="chat-search-input">
+            </div>
+            <div class="chat-friend-list" id="chat-friend-list">
+                <% if (friends.length === 0) { %>
+                <div class="no-friends-msg">No friends yet. Add friends to start chatting!</div>
+                <% } else { %>
+                <% friends.forEach(function(f) { %>
+                <div class="chat-friend-item" data-friend-id="<%= f._id %>" data-friend-name="<%= f.username %>">
+                    <div class="friend-avatar"><%= f.username.charAt(0).toUpperCase() %></div>
+                    <div class="friend-info">
+                        <div class="friend-name"><%= f.username %></div>
+                        <div class="friend-preview" id="preview-<%= f._id %>">Click to start chatting</div>
+                    </div>
+                    <div class="friend-meta">
+                        <div class="friend-time" id="time-<%= f._id %>"></div>
+                        <div class="friend-unread-badge" id="unread-<%= f._id %>" style="display:none;">0</div>
+                    </div>
+                </div>
+                <% }); %>
+                <% } %>
+            </div>
+        </div>
+
+        <!-- Right side: Chat area -->
+        <div class="chat-main" id="chat-main">
+            <div class="chat-main-empty" id="chat-empty">
+                <div class="chat-empty-icon"><i class="fa fa-comments-o"></i></div>
+                <h4>Select a friend to start chatting</h4>
+                <p>Your messages are end-to-end encrypted</p>
+            </div>
+            <div class="chat-active" id="chat-active" style="display:none;">
+                <div class="chat-active-header" id="chat-active-header">
+                    <button class="chat-back-btn" id="chat-back-btn"><i class="fa fa-arrow-left"></i></button>
+                    <div class="chat-active-avatar" id="chat-active-avatar"></div>
+                    <div class="chat-active-info">
+                        <div class="chat-active-name" id="chat-active-name"></div>
+                        <div class="chat-active-status" id="chat-active-status"><i class="fa fa-lock"></i> encrypted</div>
+                    </div>
+                </div>
+                <div id="e2ee-status" class="e2ee-status" style="display:none;"></div>
+                <div class="chat-messages" id="chat-messages"></div>
+                <div id="typing-indicator" class="typing-indicator" style="display:none;"></div>
+                <div class="chat-input-area">
+                    <form id="chat-input-form">
+                        <input type="text" id="chat-input-msg" class="chat-input-field" placeholder="Type a message..." disabled>
+                        <button type="submit" class="chat-send-btn" id="chat-send-btn" disabled><i class="fa fa-paper-plane"></i></button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<%- include('../partials/footer') %>
+<script>
+(async function() {
+    const currentUserId = "<%= user._id %>";
+    const currentUsername = "<%- user.username.replace(/[^a-zA-Z0-9 _-]/g, '') %>";
+    const friendsData = <%- JSON.stringify(friends.map(f => ({ _id: String(f._id), username: f.username }))) %>;
+
+    // DOM refs
+    const friendList = document.getElementById("chat-friend-list");
+    const chatEmpty = document.getElementById("chat-empty");
+    const chatActive = document.getElementById("chat-active");
+    const chatMessages = document.getElementById("chat-messages");
+    const chatActiveName = document.getElementById("chat-active-name");
+    const chatActiveAvatar = document.getElementById("chat-active-avatar");
+    const chatActiveStatus = document.getElementById("chat-active-status");
+    const e2eeStatus = document.getElementById("e2ee-status");
+    const inputForm = document.getElementById("chat-input-form");
+    const inputMsg = document.getElementById("chat-input-msg");
+    const sendBtn = document.getElementById("chat-send-btn");
+    const typingIndicator = document.getElementById("typing-indicator");
+    const friendSearch = document.getElementById("friend-search");
+    const chatBackBtn = document.getElementById("chat-back-btn");
+    const chatSidebar = document.getElementById("chat-sidebar");
+    const chatMain = document.getElementById("chat-main");
+
+    const receiveTone = new Audio("/assets/sounds/incoming.mp3");
+    const sendTone = new Audio("/assets/sounds/ping.mp3");
+
+    let activeFriendId = null;
+    let sharedKeys = {}; // friendId -> AES key
+    let myKeys = null;
+    let typingTimeout = null;
+
+    // === Crypto Utilities ===
+    function bufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary);
+    }
+    function base64ToBuffer(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes.buffer;
+    }
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    function formatTime(date) {
+        const d = new Date(date);
+        const now = new Date();
+        if (d.toDateString() === now.toDateString()) {
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+        return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    }
+
+    // === IndexedDB ===
+    function openKeyStore() {
+        return new Promise((resolve, reject) => {
+            const r = indexedDB.open('E2EEKeyStore', 1);
+            r.onupgradeneeded = (e) => e.target.result.createObjectStore('keys', { keyPath: 'userId' });
+            r.onsuccess = (e) => resolve(e.target.result);
+            r.onerror = (e) => reject(e.target.error);
+        });
+    }
+    async function loadKeyPair(userId) {
+        const db = await openKeyStore();
+        return new Promise((resolve) => {
+            const tx = db.transaction('keys', 'readonly');
+            const req = tx.objectStore('keys').get(userId);
+            req.onsuccess = async (e) => {
+                const result = e.target.result;
+                if (!result) return resolve(null);
+                try {
+                    const privateKey = await crypto.subtle.importKey('jwk', result.privateKeyJwk,
+                        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+                    resolve({ privateKey, publicKeyBase64: result.publicKeyBase64 });
+                } catch (err) { resolve(null); }
+            };
+            req.onerror = () => resolve(null);
+        });
+    }
+    async function saveKeyPair(userId, keyPair) {
+        const db = await openKeyStore();
+        const jwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+        const pub = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('keys', 'readwrite');
+            tx.objectStore('keys').put({ userId, privateKeyJwk: jwk, publicKeyBase64: bufferToBase64(pub) });
+            tx.oncomplete = () => resolve();
+            tx.onerror = (e) => reject(e.target.error);
+        });
+    }
+    async function getOrCreateKeyPair() {
+        let stored = await loadKeyPair(currentUserId);
+        if (stored) return stored;
+        const keyPair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+        const pubRaw = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+        await saveKeyPair(currentUserId, keyPair);
+        return { privateKey: keyPair.privateKey, publicKeyBase64: bufferToBase64(pubRaw) };
+    }
+
+    // === Key Exchange ===
+    async function fetchFriendPublicKey(friendId) {
+        const res = await fetch('/api/publickey/' + friendId);
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data.publicKey;
+    }
+    async function deriveSharedKey(myPrivateKey, friendPubBase64) {
+        const friendPub = await crypto.subtle.importKey('spki', base64ToBuffer(friendPubBase64),
+            { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+        return crypto.subtle.deriveKey({ name: 'ECDH', public: friendPub }, myPrivateKey,
+            { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    }
+    async function getSharedKey(friendId) {
+        if (sharedKeys[friendId]) return sharedKeys[friendId];
+        const pubKey = await fetchFriendPublicKey(friendId);
+        if (!pubKey) return null;
+        const key = await deriveSharedKey(myKeys.privateKey, pubKey);
+        sharedKeys[friendId] = key;
+        return key;
+    }
+
+    // === Encrypt / Decrypt ===
+    async function encryptMessage(message, key) {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(message));
+        return { ciphertext: bufferToBase64(ct), iv: bufferToBase64(iv) };
+    }
+    async function decryptMessage(ciphertext, iv, key) {
+        try {
+            const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBuffer(iv) }, key, base64ToBuffer(ciphertext));
+            return new TextDecoder().decode(dec);
+        } catch (e) { return null; }
+    }
+
+    // === Initialize keys ===
+    try {
+        myKeys = await getOrCreateKeyPair();
+        await fetch('/api/publickey', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ publicKey: myKeys.publicKeyBase64 }) });
+    } catch(e) { console.error("Key init failed:", e); }
+
+    // === Socket.io ===
+    const socket = io("/private-chat");
+    socket.emit("register", currentUserId);
+
+    // === Load unread counts + last messages ===
+    async function loadSidebarData() {
+        try {
+            const [unreadRes, lastMsgRes] = await Promise.all([
+                fetch('/api/unread-counts'),
+                fetch('/api/last-messages')
+            ]);
+            if (unreadRes.ok) {
+                const counts = await unreadRes.json();
+                for (const fid in counts) {
+                    const badge = document.getElementById('unread-' + fid);
+                    if (badge) {
+                        badge.textContent = counts[fid];
+                        badge.style.display = counts[fid] > 0 ? 'flex' : 'none';
+                    }
+                }
+            }
+            if (lastMsgRes.ok) {
+                const lastMsgs = await lastMsgRes.json();
+                for (const lm of lastMsgs) {
+                    const key = await getSharedKey(lm.friendId);
+                    const preview = document.getElementById('preview-' + lm.friendId);
+                    const timeEl = document.getElementById('time-' + lm.friendId);
+                    if (preview && key) {
+                        const text = await decryptMessage(lm.ciphertext, lm.iv, key);
+                        if (text) {
+                            const isMine = lm.sender === currentUserId;
+                            const truncated = text.length > 30 ? text.substring(0, 30) + '...' : text;
+                            preview.textContent = (isMine ? 'You: ' : '') + truncated;
+                        } else {
+                            preview.textContent = '[Encrypted message]';
+                        }
+                    } else if (preview) {
+                        preview.textContent = '[Encrypted message]';
+                    }
+                    if (timeEl) timeEl.textContent = formatTime(lm.timestamp);
+                }
+            }
+        } catch(e) { console.error("Sidebar load error:", e); }
+    }
+    loadSidebarData();
+
+    // === Open chat with a friend ===
+    async function openChat(friendId) {
+        const friend = friendsData.find(f => f._id === friendId);
+        if (!friend) return;
+
+        activeFriendId = friendId;
+        chatEmpty.style.display = 'none';
+        chatActive.style.display = 'flex';
+        chatMessages.innerHTML = '';
+        chatActiveName.textContent = friend.username;
+        chatActiveAvatar.textContent = friend.username.charAt(0).toUpperCase();
+        inputMsg.disabled = true;
+        sendBtn.disabled = true;
+
+        // Highlight active friend
+        document.querySelectorAll('.chat-friend-item').forEach(el => el.classList.remove('active'));
+        const activeItem = document.querySelector('[data-friend-id="'+friendId+'"]');
+        if (activeItem) activeItem.classList.add('active');
+
+        // Mobile: show chat, hide sidebar
+        chatSidebar.classList.add('hidden-mobile');
+        chatMain.classList.add('show-mobile');
+
+        // E2EE setup
+        e2eeStatus.style.display = 'block';
+        e2eeStatus.textContent = 'Establishing secure connection...';
+        e2eeStatus.className = 'e2ee-status';
+
+        let key = await getSharedKey(friendId);
+        if (!key) {
+            // Retry a few times
+            for (let i = 0; i < 5; i++) {
+                e2eeStatus.textContent = 'Waiting for encryption keys...';
+                await new Promise(r => setTimeout(r, 2000));
+                key = await getSharedKey(friendId);
+                if (key) break;
+            }
+        }
+        if (!key) {
+            e2eeStatus.textContent = friend.username + " hasn't logged in yet. They'll get encryption keys on their next visit.";
+            e2eeStatus.style.color = '#cc6600';
+            return;
+        }
+
+        e2eeStatus.textContent = 'Secure connection established';
+        e2eeStatus.classList.add('e2ee-ready');
+        setTimeout(() => { e2eeStatus.style.display = 'none'; }, 1500);
+
+        inputMsg.disabled = false;
+        sendBtn.disabled = false;
+        inputMsg.focus();
+
+        // Mark messages as read
+        fetch('/api/messages/' + friendId + '/read', { method: 'PUT', headers: { 'Content-Type': 'application/json' } });
+        const badge = document.getElementById('unread-' + friendId);
+        if (badge) { badge.style.display = 'none'; badge.textContent = '0'; }
+        updateNavBadge();
+
+        // Load history
+        try {
+            const histRes = await fetch('/api/messages/' + friendId);
+            if (histRes.ok) {
+                const messages = await histRes.json();
+                for (const msg of messages) {
+                    const text = await decryptMessage(msg.ciphertext, msg.iv, key);
+                    if (text) {
+                        const isMine = msg.sender === currentUserId;
+                        appendChatMessage(text, isMine ? 'right' : 'left',
+                            isMine ? 'You' : friend.username, formatTime(msg.timestamp));
+                    } else {
+                        appendSystemMessage('[Could not decrypt message]', '#cc0000');
+                    }
+                }
+            }
+        } catch(e) { console.error("Load history error:", e); }
+    }
+
+    // === UI: append messages ===
+    function appendChatMessage(text, position, sender, time) {
+        const div = document.createElement('div');
+        div.innerHTML = '<h6 class="mr-1 ml-1">' + escapeHtml(sender) + '</h6>'
+            + escapeHtml(text) + '<span class="msg-time">' + escapeHtml(time || '') + '</span>';
+        div.classList.add('message', position);
+        chatMessages.append(div);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+    function appendSystemMessage(msg, color) {
+        const div = document.createElement('div');
+        div.textContent = msg;
+        div.classList.add('info_message', 'center');
+        if (color) div.style.color = color;
+        chatMessages.append(div);
+    }
+
+    // === Friend list click ===
+    document.querySelectorAll('.chat-friend-item').forEach(item => {
+        item.addEventListener('click', () => openChat(item.dataset.friendId));
+    });
+
+    // === Back button (mobile) ===
+    chatBackBtn.addEventListener('click', () => {
+        chatSidebar.classList.remove('hidden-mobile');
+        chatMain.classList.remove('show-mobile');
+        activeFriendId = null;
+        chatActive.style.display = 'none';
+        chatEmpty.style.display = 'flex';
+    });
+
+    // === Friend search filter ===
+    friendSearch.addEventListener('input', () => {
+        const q = friendSearch.value.toLowerCase();
+        document.querySelectorAll('.chat-friend-item').forEach(item => {
+            const name = item.dataset.friendName.toLowerCase();
+            item.style.display = name.includes(q) ? 'flex' : 'none';
+        });
+    });
+
+    // === Send message ===
+    inputForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const msg = inputMsg.value.trim();
+        if (!msg || !activeFriendId) return;
+        const key = sharedKeys[activeFriendId];
+        if (!key) return;
+
+        try {
+            const encrypted = await encryptMessage(msg, key);
+            socket.emit('private-message', {
+                to: activeFriendId,
+                ciphertext: encrypted.ciphertext,
+                iv: encrypted.iv
+            });
+            appendChatMessage(msg, 'right', 'You', formatTime(new Date()));
+            sendTone.play();
+            inputMsg.value = '';
+            inputMsg.focus();
+            socket.emit('stop-typing', { to: activeFriendId });
+
+            // Update sidebar preview
+            const preview = document.getElementById('preview-' + activeFriendId);
+            const timeEl = document.getElementById('time-' + activeFriendId);
+            if (preview) preview.textContent = 'You: ' + (msg.length > 30 ? msg.substring(0, 30) + '...' : msg);
+            if (timeEl) timeEl.textContent = formatTime(new Date());
+        } catch(err) { console.error("Send error:", err); }
+    });
+
+    // === Receive message ===
+    socket.on("private-message", async (data) => {
+        const fromFriend = friendsData.find(f => f._id === data.from);
+        const friendName = fromFriend ? fromFriend.username : 'Unknown';
+
+        // If this chat is open, show inline + mark as read
+        if (data.from === activeFriendId) {
+            const key = sharedKeys[activeFriendId];
+            if (key) {
+                const text = await decryptMessage(data.ciphertext, data.iv, key);
+                if (text) {
+                    appendChatMessage(text, 'left', friendName, formatTime(data.timestamp || new Date()));
+                    receiveTone.play();
+                    // Update preview
+                    const preview = document.getElementById('preview-' + data.from);
+                    const timeEl = document.getElementById('time-' + data.from);
+                    if (preview) preview.textContent = text.length > 30 ? text.substring(0, 30) + '...' : text;
+                    if (timeEl) timeEl.textContent = formatTime(data.timestamp || new Date());
+                } else {
+                    appendSystemMessage('[Could not decrypt]', '#cc0000');
+                }
+            }
+            // Mark as read
+            fetch('/api/messages/' + data.from + '/read', { method: 'PUT', headers: { 'Content-Type': 'application/json' } });
+        } else {
+            // Not the active chat - show unread badge + update preview
+            const badge = document.getElementById('unread-' + data.from);
+            if (badge) {
+                const curr = parseInt(badge.textContent) || 0;
+                badge.textContent = curr + 1;
+                badge.style.display = 'flex';
+            }
+            // Try to decrypt for preview
+            const key = await getSharedKey(data.from);
+            if (key) {
+                const text = await decryptMessage(data.ciphertext, data.iv, key);
+                const preview = document.getElementById('preview-' + data.from);
+                const timeEl = document.getElementById('time-' + data.from);
+                if (preview && text) preview.textContent = text.length > 30 ? text.substring(0, 30) + '...' : text;
+                else if (preview) preview.textContent = '[New message]';
+                if (timeEl) timeEl.textContent = formatTime(data.timestamp || new Date());
+            }
+            receiveTone.play();
+            updateNavBadge();
+        }
+    });
+
+    // === Typing indicators ===
+    inputMsg.addEventListener('input', () => {
+        if (!activeFriendId) return;
+        socket.emit('typing', { to: activeFriendId });
+        clearTimeout(typingTimeout);
+        typingTimeout = setTimeout(() => socket.emit('stop-typing', { to: activeFriendId }), 1500);
+    });
+    socket.on("typing", (data) => {
+        if (data.from === activeFriendId) {
+            const f = friendsData.find(x => x._id === data.from);
+            typingIndicator.textContent = (f ? f.username : 'Friend') + ' is typing...';
+            typingIndicator.style.display = 'block';
+        }
+    });
+    socket.on("stop-typing", (data) => {
+        if (data.from === activeFriendId) typingIndicator.style.display = 'none';
+    });
+
+    // === Nav badge updater ===
+    async function updateNavBadge() {
+        try {
+            const res = await fetch('/api/unread-total');
+            if (res.ok) {
+                const data = await res.json();
+                const badge = document.getElementById('nav-unread-badge');
+                if (badge) {
+                    badge.textContent = data.count;
+                    badge.style.display = data.count > 0 ? 'inline-flex' : 'none';
+                }
+            }
+        } catch(e) {}
+    }
+    updateNavBadge();
+    // Poll nav badge every 15s
+    setInterval(updateNavBadge, 15000);
+
+    // === Check URL for direct friend open ===
+    const params = new URLSearchParams(window.location.search);
+    const directFriendId = params.get('open');
+    if (directFriendId && friendsData.find(f => f._id === directFriendId)) {
+        openChat(directFriendId);
+    }
+})();
+</script>

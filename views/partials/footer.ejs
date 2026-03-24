@@ -13,6 +13,80 @@
 <!-- <script defer src="/socket.io/socket.io.js"></script> -->
 <script  src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/1.4.5/socket.io.min.js"></script>
 <script  src="/js/main.js"></script>
+<% if (typeof currentUser !== 'undefined' && currentUser) { %>
+<script>
+// Auto-generate E2EE keys for logged-in users on every page load
+(async function() {
+    try {
+        var uid = "<%= currentUser._id %>";
+        function _bufToB64(buf) {
+            var b = new Uint8Array(buf), s = '';
+            for (var i = 0; i < b.byteLength; i++) s += String.fromCharCode(b[i]);
+            return btoa(s);
+        }
+        function _openKS() {
+            return new Promise(function(resolve, reject) {
+                var r = indexedDB.open('E2EEKeyStore', 1);
+                r.onupgradeneeded = function(e) { e.target.result.createObjectStore('keys', { keyPath: 'userId' }); };
+                r.onsuccess = function(e) { resolve(e.target.result); };
+                r.onerror = function(e) { reject(e.target.error); };
+            });
+        }
+        function _getKey(db, id) {
+            return new Promise(function(resolve) {
+                var tx = db.transaction('keys', 'readonly');
+                var req = tx.objectStore('keys').get(id);
+                req.onsuccess = function(e) { resolve(e.target.result || null); };
+                req.onerror = function() { resolve(null); };
+            });
+        }
+        function _saveKey(db, id, jwk, pub64) {
+            return new Promise(function(resolve, reject) {
+                var tx = db.transaction('keys', 'readwrite');
+                tx.objectStore('keys').put({ userId: id, privateKeyJwk: jwk, publicKeyBase64: pub64 });
+                tx.oncomplete = function() { resolve(); };
+                tx.onerror = function(e) { reject(e.target.error); };
+            });
+        }
+        var db = await _openKS();
+        var existing = await _getKey(db, uid);
+        if (!existing) {
+            var kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+            var pubRaw = await crypto.subtle.exportKey('spki', kp.publicKey);
+            var pub64 = _bufToB64(pubRaw);
+            var jwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+            await _saveKey(db, uid, jwk, pub64);
+            await fetch('/api/publickey', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ publicKey: pub64 })
+            });
+        } else if (existing.publicKeyBase64) {
+            // Ensure server has the key (in case prior upload failed)
+            await fetch('/api/publickey', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ publicKey: existing.publicKeyBase64 })
+            });
+        }
+    } catch(e) { /* silent */ }
+})();
+// Load unread badge count on every page
+(async function() {
+    try {
+        var res = await fetch('/api/unread-total');
+        if (res.ok) {
+            var data = await res.json();
+            var badge = document.getElementById('nav-unread-badge');
+            if (badge) {
+                badge.textContent = data.count;
+                badge.style.display = data.count > 0 ? 'inline-flex' : 'none';
+            }
+        }
+    } catch(e) {}
+})();
+</script>
+<% } %>
 </body>
 
 </html>

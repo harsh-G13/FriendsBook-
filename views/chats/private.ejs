@@ -1,0 +1,368 @@
+<%- include('../partials/header') %>
+<div class="container-fluid pl-3 pr-3">
+    <div class="row">
+        <div class="col-md-12">
+            <div class="private-chat-container">
+                <div class="private-chat-header">
+                    <a href="/friends" class="back-btn"><i class="fa fa-arrow-left"></i></a>
+                    <h4 class="mb-0 ml-2"><%= friend.username %></h4>
+                    <span class="e2ee-badge ml-auto" title="Messages are end-to-end encrypted"><i class="fa fa-lock"></i> E2EE</span>
+                </div>
+                <div id="e2ee-status" class="e2ee-status">Establishing secure connection...</div>
+                <div class="private-chat-box" id="private-chat-box"></div>
+                <div id="typing-indicator" class="typing-indicator" style="display:none;"></div>
+                <div class="private-input-div pb-3">
+                    <form id="private-input-form">
+                        <input type="text" class="private-input-msg" id="private-input-msg" placeholder="Type an encrypted message..." autofocus disabled>
+                        <button class="msg_send_btn" type="submit" id="send-btn" disabled>
+                            <i class="fa fa-paper-plane-o" aria-hidden="true"></i>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<%- include('../partials/footer') %>
+<script>
+(async function() {
+    // === Configuration ===
+    const currentUserId = "<%= user._id %>";
+    const currentUsername = "<%- user.username.replace(/[^a-zA-Z0-9 _-]/g, '') %>";
+    const friendId = "<%= friend._id %>";
+    const friendUsername = "<%- friend.username.replace(/[^a-zA-Z0-9 _-]/g, '') %>";
+
+    const chatBox = document.getElementById("private-chat-box");
+    const inputForm = document.getElementById("private-input-form");
+    const inputMsg = document.getElementById("private-input-msg");
+    const sendBtn = document.getElementById("send-btn");
+    const e2eeStatus = document.getElementById("e2ee-status");
+    const typingIndicator = document.getElementById("typing-indicator");
+    const receiveTone = new Audio("/assets/sounds/incoming.mp3");
+    const sendTone = new Audio("/assets/sounds/ping.mp3");
+
+    let sharedKey = null;
+    let typingTimeout = null;
+
+    // === Utility Functions ===
+    function bufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
+
+    function base64ToBuffer(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    function formatTime(date) {
+        const d = new Date(date);
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    // === IndexedDB for key persistence ===
+    function openKeyStore() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open('E2EEKeyStore', 1);
+            request.onupgradeneeded = (e) => {
+                e.target.result.createObjectStore('keys', { keyPath: 'userId' });
+            };
+            request.onsuccess = (e) => resolve(e.target.result);
+            request.onerror = (e) => reject(e.target.error);
+        });
+    }
+
+    async function saveKeyPair(userId, keyPair) {
+        const db = await openKeyStore();
+        const exported = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+        const publicExported = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('keys', 'readwrite');
+            tx.objectStore('keys').put({
+                userId: userId,
+                privateKeyJwk: exported,
+                publicKeyBase64: bufferToBase64(publicExported)
+            });
+            tx.oncomplete = () => resolve();
+            tx.onerror = (e) => reject(e.target.error);
+        });
+    }
+
+    async function loadKeyPair(userId) {
+        const db = await openKeyStore();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction('keys', 'readonly');
+            const request = tx.objectStore('keys').get(userId);
+            request.onsuccess = async (e) => {
+                const result = e.target.result;
+                if (!result) return resolve(null);
+                try {
+                    const privateKey = await crypto.subtle.importKey(
+                        'jwk', result.privateKeyJwk,
+                        { name: 'ECDH', namedCurve: 'P-256' },
+                        true, ['deriveKey']
+                    );
+                    resolve({ privateKey, publicKeyBase64: result.publicKeyBase64 });
+                } catch (err) {
+                    resolve(null);
+                }
+            };
+            request.onerror = () => resolve(null);
+        });
+    }
+
+    // === Key Generation / Loading ===
+    async function getOrCreateKeyPair() {
+        let stored = await loadKeyPair(currentUserId);
+        if (stored) {
+            return stored;
+        }
+        // Generate new ECDH key pair
+        const keyPair = await crypto.subtle.generateKey(
+            { name: 'ECDH', namedCurve: 'P-256' },
+            true,
+            ['deriveKey']
+        );
+        const publicKeyRaw = await crypto.subtle.exportKey('spki', keyPair.publicKey);
+        const publicKeyBase64 = bufferToBase64(publicKeyRaw);
+        await saveKeyPair(currentUserId, keyPair);
+        return { privateKey: keyPair.privateKey, publicKeyBase64 };
+    }
+
+    // === Upload public key to server ===
+    async function uploadPublicKey(publicKeyBase64) {
+        const res = await fetch('/api/publickey', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ publicKey: publicKeyBase64 })
+        });
+        if (!res.ok) throw new Error('Failed to upload public key');
+    }
+
+    // === Fetch friend's public key ===
+    async function fetchFriendPublicKey() {
+        const res = await fetch('/api/publickey/' + friendId);
+        if (!res.ok) throw new Error('Failed to fetch friend public key');
+        const data = await res.json();
+        return data.publicKey;
+    }
+
+    // === Derive shared AES key via ECDH ===
+    async function deriveSharedKey(myPrivateKey, friendPublicKeyBase64) {
+        const friendPublicKeyBuffer = base64ToBuffer(friendPublicKeyBase64);
+        const friendPublicKey = await crypto.subtle.importKey(
+            'spki', friendPublicKeyBuffer,
+            { name: 'ECDH', namedCurve: 'P-256' },
+            false, []
+        );
+        return crypto.subtle.deriveKey(
+            { name: 'ECDH', public: friendPublicKey },
+            myPrivateKey,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt', 'decrypt']
+        );
+    }
+
+    // === Encrypt message ===
+    async function encryptMessage(message) {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const encoded = new TextEncoder().encode(message);
+        const ciphertext = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv: iv },
+            sharedKey,
+            encoded
+        );
+        return {
+            ciphertext: bufferToBase64(ciphertext),
+            iv: bufferToBase64(iv)
+        };
+    }
+
+    // === Decrypt message ===
+    async function decryptMessage(ciphertextBase64, ivBase64) {
+        try {
+            const decrypted = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: base64ToBuffer(ivBase64) },
+                sharedKey,
+                base64ToBuffer(ciphertextBase64)
+            );
+            return new TextDecoder().decode(decrypted);
+        } catch (e) {
+            return null; // Decryption failed - tampered or wrong key
+        }
+    }
+
+    // === UI functions ===
+    function appendMessage(text, position, sender, time) {
+        const div = document.createElement("div");
+        const safeText = escapeHtml(text);
+        const safeSender = escapeHtml(sender);
+        div.innerHTML = '<h6 class="mr-1 ml-1">' + safeSender + '</h6>' + safeText + '<span class="msg-time">' + escapeHtml(time || '') + '</span>';
+        div.classList.add("message", position);
+        chatBox.append(div);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function appendInfoMessage(msg) {
+        const div = document.createElement("div");
+        div.textContent = msg;
+        div.classList.add("info_message", "center");
+        chatBox.append(div);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function appendDecryptError() {
+        const div = document.createElement("div");
+        div.textContent = "[Could not decrypt message]";
+        div.classList.add("info_message", "center");
+        div.style.color = "#cc0000";
+        chatBox.append(div);
+    }
+
+    // === Initialize E2EE ===
+    try {
+        e2eeStatus.textContent = "Generating encryption keys...";
+        const myKeys = await getOrCreateKeyPair();
+
+        e2eeStatus.textContent = "Uploading public key...";
+        await uploadPublicKey(myKeys.publicKeyBase64);
+
+        e2eeStatus.textContent = "Fetching friend's encryption key...";
+        let friendPubKey = await fetchFriendPublicKey();
+
+        // If friend hasn't generated keys yet, wait and retry
+        if (!friendPubKey) {
+            const maxRetries = 15;
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                e2eeStatus.textContent = "Waiting for " + friendUsername + "'s encryption key... (" + attempt + "/" + maxRetries + ")";
+                await new Promise(r => setTimeout(r, 2000));
+                friendPubKey = await fetchFriendPublicKey();
+                if (friendPubKey) break;
+            }
+            if (!friendPubKey) {
+                e2eeStatus.textContent = friendUsername + " hasn't logged in yet. They'll get their encryption keys automatically on their next visit.";
+                e2eeStatus.style.color = "#cc6600";
+                return;
+            }
+        }
+
+        e2eeStatus.textContent = "Deriving shared secret...";
+        sharedKey = await deriveSharedKey(myKeys.privateKey, friendPubKey);
+
+        e2eeStatus.textContent = "Secure connection established";
+        e2eeStatus.classList.add("e2ee-ready");
+        setTimeout(() => { e2eeStatus.style.display = 'none'; }, 2000);
+
+        // Enable input
+        inputMsg.disabled = false;
+        sendBtn.disabled = false;
+
+        // === Load message history ===
+        try {
+            const histRes = await fetch('/api/messages/' + friendId);
+            if (histRes.ok) {
+                const messages = await histRes.json();
+                for (const msg of messages) {
+                    const plaintext = await decryptMessage(msg.ciphertext, msg.iv);
+                    if (plaintext !== null) {
+                        const isMine = msg.sender === currentUserId;
+                        appendMessage(
+                            plaintext,
+                            isMine ? 'right' : 'left',
+                            isMine ? 'You' : friendUsername,
+                            formatTime(msg.timestamp)
+                        );
+                    } else {
+                        appendDecryptError();
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load history:', e);
+        }
+
+    } catch (err) {
+        e2eeStatus.textContent = "Failed to establish secure connection: " + err.message;
+        e2eeStatus.style.color = "#cc0000";
+        console.error(err);
+        return;
+    }
+
+    // === Socket.io connection ===
+    const socket = io("/private-chat");
+    socket.emit("register", currentUserId);
+
+    // Send encrypted message
+    inputForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const message = inputMsg.value.trim();
+        if (!message || !sharedKey) return;
+
+        try {
+            const encrypted = await encryptMessage(message);
+            socket.emit('private-message', {
+                to: friendId,
+                ciphertext: encrypted.ciphertext,
+                iv: encrypted.iv
+            });
+            appendMessage(message, 'right', 'You', formatTime(new Date()));
+            sendTone.play();
+            inputMsg.value = "";
+            inputMsg.focus();
+            socket.emit('stop-typing', { to: friendId });
+        } catch (err) {
+            console.error("Encryption failed:", err);
+        }
+    });
+
+    // Receive encrypted message
+    socket.on("private-message", async (data) => {
+        if (data.from !== friendId) return; // Only show messages from this friend
+        const plaintext = await decryptMessage(data.ciphertext, data.iv);
+        if (plaintext !== null) {
+            appendMessage(plaintext, 'left', friendUsername, formatTime(data.timestamp || new Date()));
+            receiveTone.play();
+        } else {
+            appendDecryptError();
+        }
+    });
+
+    // Typing indicators
+    inputMsg.addEventListener('input', () => {
+        socket.emit('typing', { to: friendId });
+        clearTimeout(typingTimeout);
+        typingTimeout = setTimeout(() => {
+            socket.emit('stop-typing', { to: friendId });
+        }, 1500);
+    });
+
+    socket.on("typing", (data) => {
+        if (data.from === friendId) {
+            typingIndicator.textContent = friendUsername + " is typing...";
+            typingIndicator.style.display = 'block';
+        }
+    });
+
+    socket.on("stop-typing", (data) => {
+        if (data.from === friendId) {
+            typingIndicator.style.display = 'none';
+        }
+    });
+
+})();
+</script>
