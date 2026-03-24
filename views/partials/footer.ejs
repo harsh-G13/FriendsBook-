@@ -16,7 +16,8 @@
 <% if (typeof currentUser !== 'undefined' && currentUser) { %>
 <script>
 // Auto-generate E2EE keys for logged-in users on every page load
-(async function() {
+// Uses window.__e2eeKeysReady promise so chat scripts can wait for it
+window.__e2eeKeysReady = (async function() {
     try {
         var uid = "<%= currentUser._id %>";
         function _bufToB64(buf) {
@@ -56,20 +57,26 @@
             var pub64 = _bufToB64(pubRaw);
             var jwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
             await _saveKey(db, uid, jwk, pub64);
-            await fetch('/api/publickey', {
+            var uploadRes = await fetch('/api/publickey', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ publicKey: pub64 })
             });
+            var uploadData = await uploadRes.json();
+            if (uploadData.keyChanged) {
+                console.log('E2EE: Keys rotated — old messages cleared for security');
+            }
+            return pub64;
         } else if (existing.publicKeyBase64) {
-            // Ensure server has the key (in case prior upload failed)
             await fetch('/api/publickey', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ publicKey: existing.publicKeyBase64 })
             });
+            return existing.publicKeyBase64;
         }
     } catch(e) { /* silent */ }
+    return null;
 })();
 // Load unread badge count on every page
 (async function() {

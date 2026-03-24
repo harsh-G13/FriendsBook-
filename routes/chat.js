@@ -43,7 +43,7 @@ route.get("/chat/:friendId", middleWare.isLoggedIn, (req, res) => {
   });
 });
 
-// PUT save public key for current user
+// PUT save public key for current user (detects key rotation)
 route.put(
   "/api/publickey",
   middleWare.isLoggedIn,
@@ -57,11 +57,27 @@ route.put(
     ) {
       return res.status(400).json({ error: "Invalid public key" });
     }
-    user.findByIdAndUpdate(req.user._id, { publicKey: publicKey }, (err) => {
-      if (err) {
-        return res.status(500).json({ error: "Failed to save public key" });
-      }
-      res.json({ success: true });
+    // Check if this is a key rotation (different key than before)
+    user.findById(req.user._id, "publicKey", (err, foundUser) => {
+      if (err) return res.status(500).json({ error: "Server error" });
+      const oldKey = foundUser ? foundUser.publicKey : null;
+      const keyChanged = !!(oldKey && oldKey !== publicKey);
+
+      user.findByIdAndUpdate(req.user._id, { publicKey: publicKey }, (err) => {
+        if (err) {
+          return res.status(500).json({ error: "Failed to save public key" });
+        }
+        // If keys changed, old messages can't be decrypted by anyone — clean up
+        if (keyChanged) {
+          message.deleteMany(
+            {
+              $or: [{ sender: req.user._id }, { recipient: req.user._id }],
+            },
+            () => {},
+          );
+        }
+        res.json({ success: true, keyChanged: keyChanged });
+      });
     });
   },
 );

@@ -156,9 +156,16 @@
             tx.onerror = (e) => reject(e.target.error);
         });
     }
-    async function getOrCreateKeyPair() {
+    // Wait for footer to finish key generation, then load from IndexedDB
+    async function waitForKeyPair() {
+        // Wait for the footer's key generation to complete
+        if (window.__e2eeKeysReady) {
+            await window.__e2eeKeysReady;
+        }
+        // Now load from IndexedDB (footer already saved them)
         let stored = await loadKeyPair(currentUserId);
         if (stored) return stored;
+        // Fallback: if footer didn't run or failed, generate here
         const keyPair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
         const pubRaw = await crypto.subtle.exportKey('spki', keyPair.publicKey);
         await saveKeyPair(currentUserId, keyPair);
@@ -200,9 +207,10 @@
         } catch (e) { return null; }
     }
 
-    // === Initialize keys ===
+    // === Initialize keys (waits for footer to avoid race condition) ===
     try {
-        myKeys = await getOrCreateKeyPair();
+        myKeys = await waitForKeyPair();
+        // Upload to ensure server has this exact key
         await fetch('/api/publickey', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ publicKey: myKeys.publicKeyBase64 }) });
     } catch(e) { console.error("Key init failed:", e); }
@@ -316,6 +324,7 @@
             const histRes = await fetch('/api/messages/' + friendId);
             if (histRes.ok) {
                 const messages = await histRes.json();
+                let failCount = 0;
                 for (const msg of messages) {
                     const text = await decryptMessage(msg.ciphertext, msg.iv, key);
                     if (text) {
@@ -323,8 +332,11 @@
                         appendChatMessage(text, isMine ? 'right' : 'left',
                             isMine ? 'You' : friend.username, formatTime(msg.timestamp));
                     } else {
-                        appendSystemMessage('[Could not decrypt message]', '#cc0000');
+                        failCount++;
                     }
+                }
+                if (failCount > 0) {
+                    appendSystemMessage(failCount + ' older message(s) could not be decrypted (encryption keys changed).', '#999');
                 }
             }
         } catch(e) { console.error("Load history error:", e); }
@@ -406,19 +418,20 @@
 
         // If this chat is open, show inline + mark as read
         if (data.from === activeFriendId) {
-            const key = sharedKeys[activeFriendId];
+            // Re-derive key fresh in case friend's keys changed
+            delete sharedKeys[activeFriendId];
+            const key = await getSharedKey(activeFriendId);
             if (key) {
                 const text = await decryptMessage(data.ciphertext, data.iv, key);
                 if (text) {
                     appendChatMessage(text, 'left', friendName, formatTime(data.timestamp || new Date()));
                     receiveTone.play();
-                    // Update preview
                     const preview = document.getElementById('preview-' + data.from);
                     const timeEl = document.getElementById('time-' + data.from);
                     if (preview) preview.textContent = text.length > 30 ? text.substring(0, 30) + '...' : text;
                     if (timeEl) timeEl.textContent = formatTime(data.timestamp || new Date());
                 } else {
-                    appendSystemMessage('[Could not decrypt]', '#cc0000');
+                    appendSystemMessage('Could not decrypt — ask ' + friendName + ' to refresh their page.', '#cc6600');
                 }
             }
             // Mark as read

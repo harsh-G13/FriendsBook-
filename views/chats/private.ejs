@@ -125,13 +125,16 @@
         });
     }
 
-    // === Key Generation / Loading ===
-    async function getOrCreateKeyPair() {
-        let stored = await loadKeyPair(currentUserId);
-        if (stored) {
-            return stored;
+    // === Key Loading (waits for footer to generate keys) ===
+    async function waitForKeyPair() {
+        // Wait for footer's key generation to complete
+        if (window.__e2eeKeysReady) {
+            await window.__e2eeKeysReady;
         }
-        // Generate new ECDH key pair
+        // Load from IndexedDB (footer already saved them)
+        let stored = await loadKeyPair(currentUserId);
+        if (stored) return stored;
+        // Fallback: generate here if footer didn't run
         const keyPair = await crypto.subtle.generateKey(
             { name: 'ECDH', namedCurve: 'P-256' },
             true,
@@ -237,7 +240,7 @@
     // === Initialize E2EE ===
     try {
         e2eeStatus.textContent = "Generating encryption keys...";
-        const myKeys = await getOrCreateKeyPair();
+        const myKeys = await waitForKeyPair();
 
         e2eeStatus.textContent = "Uploading public key...";
         await uploadPublicKey(myKeys.publicKeyBase64);
@@ -277,6 +280,7 @@
             const histRes = await fetch('/api/messages/' + friendId);
             if (histRes.ok) {
                 const messages = await histRes.json();
+                let failCount = 0;
                 for (const msg of messages) {
                     const plaintext = await decryptMessage(msg.ciphertext, msg.iv);
                     if (plaintext !== null) {
@@ -288,8 +292,11 @@
                             formatTime(msg.timestamp)
                         );
                     } else {
-                        appendDecryptError();
+                        failCount++;
                     }
+                }
+                if (failCount > 0) {
+                    appendInfoMessage(failCount + ' older message(s) could not be decrypted (encryption keys changed).');
                 }
             }
         } catch (e) {
@@ -338,7 +345,7 @@
             appendMessage(plaintext, 'left', friendUsername, formatTime(data.timestamp || new Date()));
             receiveTone.play();
         } else {
-            appendDecryptError();
+            appendInfoMessage('Could not decrypt — ask ' + friendUsername + ' to refresh their page.');
         }
     });
 
