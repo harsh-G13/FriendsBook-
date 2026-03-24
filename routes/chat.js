@@ -7,13 +7,17 @@ let express = require("express"),
 
 // GET private chat hub page (friend list + chat area)
 route.get("/private-chats", middleWare.isLoggedIn, (req, res) => {
-  user.find({ _id: { $in: req.user.friends } }, '_id username', (err, friends) => {
-    if (err) friends = [];
-    res.render("chats/hub", {
-      user: req.user,
-      friends: friends
-    });
-  });
+  user.find(
+    { _id: { $in: req.user.friends } },
+    "_id username",
+    (err, friends) => {
+      if (err) friends = [];
+      res.render("chats/hub", {
+        user: req.user,
+        friends: friends,
+      });
+    },
+  );
 });
 
 // GET private chat page with a friend (still works for direct link)
@@ -116,79 +120,111 @@ route.get("/api/messages/:friendId", middleWare.isLoggedIn, (req, res) => {
 
 // GET unread counts per friend for current user
 route.get("/api/unread-counts", middleWare.isLoggedIn, (req, res) => {
-  message.aggregate([
-    { $match: { recipient: req.user._id, read: false } },
-    { $group: { _id: "$sender", count: { $sum: 1 } } }
-  ], (err, results) => {
-    if (err) return res.status(500).json({ error: "Failed to fetch counts" });
-    const counts = {};
-    results.forEach(r => { counts[String(r._id)] = r.count; });
-    res.json(counts);
-  });
+  message.aggregate(
+    [
+      { $match: { recipient: req.user._id, read: false } },
+      { $group: { _id: "$sender", count: { $sum: 1 } } },
+    ],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: "Failed to fetch counts" });
+      const counts = {};
+      results.forEach((r) => {
+        counts[String(r._id)] = r.count;
+      });
+      res.json(counts);
+    },
+  );
 });
 
 // GET total unread count (for nav badge)
 route.get("/api/unread-total", middleWare.isLoggedIn, (req, res) => {
-  message.countDocuments({ recipient: req.user._id, read: false }, (err, count) => {
-    if (err) return res.status(500).json({ error: "Failed" });
-    res.json({ count: count });
-  });
+  message.countDocuments(
+    { recipient: req.user._id, read: false },
+    (err, count) => {
+      if (err) return res.status(500).json({ error: "Failed" });
+      res.json({ count: count });
+    },
+  );
 });
 
 // GET last message for each friend conversation
 route.get("/api/last-messages", middleWare.isLoggedIn, (req, res) => {
-  const friendIds = req.user.friends.map(f => {
-    try { return mongoose.Types.ObjectId(f); } catch(e) { return null; }
-  }).filter(Boolean);
+  const friendIds = req.user.friends
+    .map((f) => {
+      try {
+        return mongoose.Types.ObjectId(f);
+      } catch (e) {
+        return null;
+      }
+    })
+    .filter(Boolean);
 
   if (friendIds.length === 0) return res.json([]);
 
-  message.aggregate([
-    {
-      $match: {
-        $or: [
-          { sender: req.user._id, recipient: { $in: friendIds } },
-          { sender: { $in: friendIds }, recipient: req.user._id }
-        ]
-      }
-    },
-    { $sort: { timestamp: -1 } },
-    {
-      $group: {
-        _id: {
-          $cond: [{ $eq: ["$sender", req.user._id] }, "$recipient", "$sender"]
+  message.aggregate(
+    [
+      {
+        $match: {
+          $or: [
+            { sender: req.user._id, recipient: { $in: friendIds } },
+            { sender: { $in: friendIds }, recipient: req.user._id },
+          ],
         },
-        lastMessage: { $first: "$$ROOT" }
-      }
-    }
-  ], (err, results) => {
-    if (err) return res.status(500).json({ error: "Failed" });
-    res.json(results.map(r => ({
-      friendId: String(r._id),
-      ciphertext: r.lastMessage.ciphertext,
-      iv: r.lastMessage.iv,
-      sender: String(r.lastMessage.sender),
-      timestamp: r.lastMessage.timestamp
-    })));
-  });
+      },
+      { $sort: { timestamp: -1 } },
+      {
+        $group: {
+          _id: {
+            $cond: [
+              { $eq: ["$sender", req.user._id] },
+              "$recipient",
+              "$sender",
+            ],
+          },
+          lastMessage: { $first: "$$ROOT" },
+        },
+      },
+    ],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: "Failed" });
+      res.json(
+        results.map((r) => ({
+          friendId: String(r._id),
+          ciphertext: r.lastMessage.ciphertext,
+          iv: r.lastMessage.iv,
+          sender: String(r.lastMessage.sender),
+          timestamp: r.lastMessage.timestamp,
+        })),
+      );
+    },
+  );
 });
 
 // PUT mark messages as read from a specific friend
-route.put("/api/messages/:friendId/read", middleWare.isLoggedIn, express.json(), (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.friendId)) {
-    return res.status(400).json({ error: "Invalid user ID" });
-  }
-  if (!req.user.friends.includes(req.params.friendId)) {
-    return res.status(403).json({ error: "Not authorized" });
-  }
-  message.updateMany(
-    { sender: mongoose.Types.ObjectId(req.params.friendId), recipient: req.user._id, read: false },
-    { $set: { read: true } },
-    (err) => {
-      if (err) return res.status(500).json({ error: "Failed" });
-      res.json({ success: true });
+route.put(
+  "/api/messages/:friendId/read",
+  middleWare.isLoggedIn,
+  express.json(),
+  (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.friendId)) {
+      return res.status(400).json({ error: "Invalid user ID" });
     }
-  );
-});
+    if (!req.user.friends.includes(req.params.friendId)) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    message.updateMany(
+      {
+        sender: mongoose.Types.ObjectId(req.params.friendId),
+        recipient: req.user._id,
+        read: false,
+      },
+      { $set: { read: true } },
+      (err) => {
+        if (err) return res.status(500).json({ error: "Failed" });
+        res.json({ success: true });
+      },
+    );
+  },
+);
 
 module.exports = route;
